@@ -1,0 +1,1172 @@
+name: Build AutoMine
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create AutoMine.java
+        run: |
+          mkdir -p project/src/main/java/ru/eclips/automine
+          cat > project/src/main/java/ru/eclips/automine/AutoMine.java <<'JAVAEOF'
+          package ru.eclips.automine;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.level.particle.FloatingTextParticle;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.Config;
+          import cn.nukkit.utils.ConfigSection;
+
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ThreadLocalRandom;
+          import java.util.regex.Pattern;
+
+          /**
+           * AutoMine: авто-шахты с редкостями, плашкой над шахтой и обходом регион-плагина.
+           */
+          public class AutoMine extends PluginBase implements Listener {
+
+              private static final int CONFIG_VERSION = 2;
+              private static final Pattern NAME =Pattern.compile("[A-Za-z0-9_\\-]{1,32}");
+
+              private final Map<String, Rarity> rarities = new LinkedHashMap<>();
+              private final Map<String, Integer> blockIds = new HashMap<>();
+              private final Map<Integer, Integer> minCounts = new HashMap<>();
+              private final Map<Integer, Integer> maxCounts = new HashMap<>();
+              private final Map<String, Mine> mines = new LinkedHashMap<>();
+              private final Map<UUID, Selection> selections = new HashMap<>();
+              private final List<FillJob> jobs = new ArrayList<>();
+              private final Set<Integer> warnings = new HashSet<>();
+
+              private Config minesFile;
+              private int interval = 300;
+              private int blocksPerTick = 4000;
+              private int maxVolume = 1000000;
+              private int warnRadius = 100;
+              private double holoOffset = 1.0;
+              private boolean bypass = true;
+              private String holoFormat = "";
+              private int stoneId = 1;
+              private int tickCounter = 0;
+
+              // ------------------------------------------------------------------ жизненный цикл
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  migrateConfig();
+                  saveDefaultConfig();
+                  reloadConfig();
+                  loadSettings();
+                  if (rarities.isEmpty()) {
+                      getLogger().error("В config.yml нет ни одной корректной редкости. Плагин выключен.");
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+                  minesFile = new Config(new File(getDataFolder(), "mines.yml"), Config.YAML);
+                  loadMines();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          tick();
+                      }
+                  }, 1);
+                  getLogger().info("AutoMine включен. Шахт: " + mines.size() + ", редкостей: " + rarities.size());
+              }
+
+              @Override
+              public void onDisable() {
+                  for (Mine m : mines.values()) {
+                      removeHolo(m);
+                  }
+                  if (minesFile != null) {
+                      saveMines();
+                  }
+              }
+
+              // ------------------------------------------------------------------ настройки
+
+              /**
+               * Если config.yml старой версии, он сохраняется как config-old-vN.yml,
+               * а при запуске создаётся новый с актуальными значениями.
+               * Файл с данными шахт (mines.yml) не затрагивается.
+               */
+              private void migrateConfig() {
+                  File f = new File(getDataFolder(), "config.yml");
+                  if (!f.exists()) {
+                      return;
+                  }
+                  Config old = new Config(f, Config.YAML);
+                  int version = old.getInt("config-version", 1);
+                  if (version >= CONFIG_VERSION) {
+                      return;
+                  }
+                  File backup = new File(getDataFolder(), "config-old-v" + version + ".yml");
+                  if (backup.exists()) {
+                      backup.delete();
+                  }
+                  if (f.renameTo(backup)) {
+                      getLogger().info("config.yml обновлён до версии " + CONFIG_VERSION
+                              + ", старый сохранён как " + backup.getName());
+                  } else {
+                      getLogger().warning("Не удалось сохранить старый config.yml, настройки остались прежними");
+                  }
+              }
+
+              private void loadSettings() {
+                  Config c = getConfig();
+                  interval = Math.max(10, c.getInt("reset-interval-seconds", 300));
+                  blocksPerTick = Math.max(100, c.getInt("fill-blocks-per-tick", 4000));
+                  maxVolume = c.getInt("max-volume", 1000000);
+                  warnRadius = c.getInt("warning-radius", 100);
+                  holoOffset = c.getDouble("hologram-y-offset", 1.0);
+                  bypass = c.getBoolean("bypass-region-protection", true);
+                  holoFormat = c.getString("hologram-format", "{time} {cur_name} {next_name}");
+
+                  warnings.clear();
+                  List<?> w = c.getList("warning-seconds");
+                  if (w != null) {
+                      for (Object o : w) {
+                          if (o instanceof Number) {
+                              warnings.add(((Number) o).intValue());
+                          }
+                      }
+                  }
+
+                  blockIds.clear();
+                  ConfigSection ids = c.getSection("block-ids");
+                  for (String k : ids.getKeys(false)) {
+                      blockIds.put(k.toLowerCase(), ids.getInt(k));
+                  }
+                  stoneId = blockIds.getOrDefault("stone", 1);
+
+                  minCounts.clear();
+                  ConfigSection mins = c.getSection("guaranteed-min");
+                  for (String k : mins.getKeys(false)) {
+                      int id = resolveId(k);
+                      if (id < 0) {
+                          getLogger().warning("guaranteed-min: неизвестный блок " + k);
+                          continue;
+                      }
+                      if (mins.getInt(k) > 0) {
+                          minCounts.put(id, mins.getInt(k));
+                      }
+                  }
+
+                  maxCounts.clear();
+                  ConfigSection maxs = c.getSection("max-per-reset");
+                  for (String k : maxs.getKeys(false)) {
+                      int id = resolveId(k);
+                      if (id < 0) {
+                          getLogger().warning("max-per-reset: неизвестный блок " + k);
+                          continue;
+                      }
+                      if (maxs.getInt(k) > 0) {
+                          maxCounts.put(id, maxs.getInt(k));
+                      }
+                  }
+
+                  rarities.clear();
+                  ConfigSection rs = c.getSection("rarities");
+                  for (String key : rs.getKeys(false)) {
+                      ConfigSection r = rs.getSection(key);
+                      Rarity ra = new Rarity(key, r.getString("name", key), r.getString("color", "§f"), r.getDouble("chance", 1));
+                      ConfigSection bs = r.getSection("blocks");
+                      for (String bk : bs.getKeys(false)) {
+                          int id = resolveId(bk);
+                          if (id < 0) {
+                              getLogger().warning("rarities." + key + ": неизвестный блок " + bk);
+                              continue;
+                          }
+                          ra.add(id, bs.getDouble(bk));
+                      }
+                      ra.finish();
+                      if (ra.isEmpty()) {
+                          getLogger().warning("Редкость " + key + " пропущена: нет блоков");
+                          continue;
+                      }
+                      rarities.put(key, ra);
+                  }
+              }
+
+              private int resolveId(String key) {
+                  Integer id = blockIds.get(key.toLowerCase());
+                  if (id != null) {
+                      return id;
+                  }
+                  try {
+                      return Integer.parseInt(key.trim());
+                  } catch (NumberFormatException e) {
+                      return -1;
+                  }
+              }
+
+              private String msg(String key, String... kv) {
+                  String s = getConfig().getString("messages." + key, key);
+                  for (int i = 0; i + 1 < kv.length; i += 2) {
+                      s = s.replace("{" + kv[i] + "}", kv[i + 1]);
+                  }
+                  return s.replace('&', '§');
+              }
+
+              // ------------------------------------------------------------------ хранение шахт
+
+              private void loadMines() {
+                  ConfigSection ms = minesFile.getSection("mines");
+                  for (String name : ms.getKeys(false)) {
+                      ConfigSection s = ms.getSection(name);
+                      Mine m = new Mine(name);
+                      m.world = s.getString("world");
+                      m.minX = s.getInt("minX");
+                      m.minY = s.getInt("minY");
+                      m.minZ = s.getInt("minZ");
+                      m.maxX = s.getInt("maxX");
+                      m.maxY = s.getInt("maxY");
+                      m.maxZ = s.getInt("maxZ");
+                      m.current = s.getString("current");
+                      m.next = s.getString("next");
+                      if (!rarities.containsKey(m.current)) {
+                          m.current = randomRarityKey();
+                      }
+                      if (!rarities.containsKey(m.next)) {
+                          m.next = randomRarityKey();
+                      }
+                      m.hasSpawn = s.getBoolean("spawnSet");
+                      m.spawnWorld = s.getString("spawnWorld");
+                      m.sx = s.getDouble("spawnX");
+                      m.sy = s.getDouble("spawnY");
+                      m.sz = s.getDouble("spawnZ");
+                      m.syaw = s.getDouble("spawnYaw");
+                      m.spitch = s.getDouble("spawnPitch");
+                      m.hasHolo = s.getBoolean("holoSet");
+                      m.holoWorld = s.getString("holoWorld");
+                      m.hx = s.getDouble("holoX");
+                      m.hy = s.getDouble("holoY");
+                      m.hz = s.getDouble("holoZ");
+                      m.remaining = interval;
+                      mines.put(name, m);
+                  }
+              }
+
+              private void saveMines() {
+                  minesFile.remove("mines");
+                  for (Mine m : mines.values()) {
+                      String p = "mines." + m.name + ".";
+                      minesFile.set(p + "world", m.world);
+                      minesFile.set(p + "minX", m.minX);
+                      minesFile.set(p + "minY", m.minY);
+                      minesFile.set(p + "minZ", m.minZ);
+                      minesFile.set(p + "maxX", m.maxX);
+                      minesFile.set(p + "maxY", m.maxY);
+                      minesFile.set(p + "maxZ", m.maxZ);
+                      minesFile.set(p + "current", m.current);
+                      minesFile.set(p + "next", m.next);
+                      minesFile.set(p + "spawnSet", m.hasSpawn);
+                      minesFile.set(p + "spawnWorld", m.spawnWorld == null ? "" : m.spawnWorld);
+                      minesFile.set(p + "spawnX", m.sx);
+                      minesFile.set(p + "spawnY", m.sy);
+                      minesFile.set(p + "spawnZ", m.sz);
+                      minesFile.set(p + "spawnYaw", m.syaw);
+                      minesFile.set(p + "spawnPitch", m.spitch);
+                      minesFile.set(p + "holoSet", m.hasHolo);
+                      minesFile.set(p + "holoWorld", m.holoWorld == null ? "" : m.holoWorld);
+                      minesFile.set(p + "holoX", m.hx);
+                      minesFile.set(p + "holoY", m.hy);
+                      minesFile.set(p + "holoZ", m.hz);
+                  }
+                  minesFile.save();
+              }
+
+              // ------------------------------------------------------------------ тики
+
+              private void tick() {
+                  processJobs();
+                  if (++tickCounter >= 20) {
+                      tickCounter = 0;
+                      secondTick();
+                  }
+              }
+
+              private void secondTick() {
+                  for (Mine m : new ArrayList<>(mines.values())) {
+                      ensureHolo(m);
+                      Level lvl = getServer().getLevelByName(m.world);
+                      if (lvl == null) {
+                          updateHolo(m);
+                          continue;
+                      }
+                      if (!m.filling) {
+                          m.remaining--;
+                          if (m.remaining <= 0) {
+                              startReset(m, false);
+                          } else if (warnings.contains(m.remaining)) {
+                              notifyNearby(m, lvl, msg("warning", "mine", m.name, "sec", String.valueOf(m.remaining)));
+                          }
+                      }
+                      updateHolo(m);
+                  }
+              }
+
+              private void processJobs() {
+                  int budget = blocksPerTick;
+                  while (budget > 0 && !jobs.isEmpty()) {
+                      FillJob j = jobs.get(0);
+                      Mine m = j.mine;
+                      int sx = m.sizeX();
+                      int sz = m.sizeZ();
+                      int layer = sx * sz;
+                      while (budget > 0 && j.idx < j.ids.length) {
+                          int i = j.idx++;
+                          int x = m.minX + (i % sx);
+                          int z = m.minZ + ((i / sx) % sz);
+                          int y = m.minY + (i / layer);
+                          j.level.setBlock(new Vector3(x, y, z), Block.get(j.ids[i]), false, false);
+                          budget--;
+                      }
+                      if (j.idx >= j.ids.length) {
+                          jobs.remove(0);
+                          finishFill(j);
+                      }
+                  }
+              }
+
+              private void finishFill(FillJob j) {
+                  Mine m = j.mine;
+                  m.filling = false;
+                  m.remaining = interval;
+                  Rarity cur = rarities.get(m.current);
+                  notifyNearby(m, j.level, msg("reset-done", "mine", m.name,
+                          "rarity", (cur == null ? m.current : cur.color + cur.name)));
+                  updateHolo(m);
+              }
+
+              // ------------------------------------------------------------------ сброс шахты
+
+              private void startReset(Mine m, boolean initial) {
+                  if (m.filling) {
+                      return;
+                  }
+                  Level lvl = getServer().getLevelByName(m.world);
+                  if (lvl == null) {
+                      m.remaining = 10;
+                      return;
+                  }
+                  if (!initial) {
+                      m.current = m.next;
+                      m.next = randomRarityKey();
+                  }
+                  Rarity r = rarities.get(m.current);
+                  if (r == null) {
+                      m.current = randomRarityKey();
+                      r = rarities.get(m.current);
+                  }
+                  teleportOut(m, lvl);
+                  m.filling = true;
+                  m.remaining = 0;
+                  jobs.add(new FillJob(m, lvl, buildFill(m, r)));
+                  saveMines();
+              }
+
+              private void teleportOut(Mine m, Level lvl) {
+                  for (Player p : new ArrayList<>(lvl.getPlayers().values())) {
+                      if (!m.contains(lvl.getFolderName(), p.getFloorX(), p.getFloorY(), p.getFloorZ())) {
+                          continue;
+                      }
+                      Location dest = null;
+                      if (m.hasSpawn) {
+                          Level dl = getServer().getLevelByName(m.spawnWorld);
+                          if (dl != null) {
+                              dest = new Location(m.sx, m.sy, m.sz, m.syaw, m.spitch, dl);
+                          }
+                      }
+                      if (dest == null) {
+                          dest = new Location(p.x, m.maxY + 2, p.z, p.yaw, p.pitch, lvl);
+                      }
+                      p.teleport(dest);
+                      p.sendMessage(msg("teleported", "mine", m.name));
+                  }
+              }
+
+              private int[] buildFill(Mine m, Rarity r) {
+                  ThreadLocalRandom rnd = ThreadLocalRandom.current();
+                  int vol = m.volume();
+                  int[] arr = new int[vol];
+                  for (int i = 0; i < vol; i++) {
+                      arr[i] = r.pick(rnd);
+                  }
+
+                  // максимум за сброс (лишнее заменяется камнем)
+                  for (Map.Entry<Integer, Integer> e : maxCounts.entrySet()) {
+                      int id = e.getKey();
+                      int max = e.getValue();
+                      List<Integer> idx = new ArrayList<>();
+                      for (int i = 0; i < vol; i++) {
+                          if (arr[i] == id) {
+                              idx.add(i);
+                          }
+                      }
+                      if (idx.size() > max) {
+                          Collections.shuffle(idx, rnd);
+                          for (int k = max; k < idx.size(); k++) {
+                              arr[idx.get(k)] = stoneId;
+                          }
+                      }
+                  }
+
+                  // гарантированный минимум (недостающее ставится на место камня)
+                  for (Map.Entry<Integer, Integer> e : minCounts.entrySet()) {
+                      int id = e.getKey();
+                      int min = e.getValue();
+                      int have = 0;
+                      for (int v : arr) {
+                          if (v == id) {
+                              have++;
+                          }
+                      }
+                      int need = min - have;
+                      long tries = 0;
+                      long limit = (long) vol * 4 + 100;
+                      while (need > 0 && tries < limit) {
+                          tries++;
+                          int i = rnd.nextInt(vol);
+                          int cur = arr[i];
+                          if (cur == id || minCounts.containsKey(cur)) {
+                              continue;
+                          }
+                          if (cur != stoneId && tries < (long) vol * 2) {
+                              continue;
+                          }
+                          arr[i] = id;
+                          need--;
+                      }
+                  }
+                  return arr;
+              }
+
+              private String randomRarityKey() {
+                  double total = 0;
+                  for (Rarity r : rarities.values()) {
+                      total += r.chance;
+                  }
+                  double x = ThreadLocalRandom.current().nextDouble() * total;
+                  String last = null;
+                  for (Rarity r : rarities.values()) {
+                      last = r.key;
+                      if (x < r.chance) {
+                          return r.key;
+                      }
+                      x -= r.chance;
+                  }
+                  return last;
+              }
+
+              private void notifyNearby(Mine m, Level lvl, String text) {
+                  for (Player p : lvl.getPlayers().values()) {
+                      int x = p.getFloorX();
+                      int z = p.getFloorZ();
+                      if (x >= m.minX - warnRadius && x <= m.maxX + warnRadius
+                              && z >= m.minZ - warnRadius && z <= m.maxZ + warnRadius) {
+                          p.sendMessage(text);
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ плашка
+
+              private String holoText(Mine m) {
+                  Rarity c = rarities.get(m.current);
+                  Rarity n = rarities.get(m.next);
+                  int t = Math.max(0, m.remaining);
+                  String time = String.format("%02d:%02d", t / 60, t % 60);
+                  return holoFormat
+                          .replace("{time}", time)
+                          .replace("{cur_color}", c == null ? "§f" : c.color)
+                          .replace("{cur_name}", c == null ? m.current : c.name)
+                          .replace("{next_color}", n == null ? "§f" : n.color)
+                          .replace("{next_name}", n == null ? m.next : n.name);
+              }
+
+              private void ensureHolo(Mine m) {
+                  if (!m.hasHolo || m.particle != null) {
+                      return;
+                  }
+                  Level hl = getServer().getLevelByName(m.holoWorld);
+                  if (hl == null) {
+                      return;
+                  }
+                  m.holoLevel = hl;
+                  m.particle = new FloatingTextParticle(new Vector3(m.hx, m.hy, m.hz), holoText(m));
+              }
+
+              private void updateHolo(Mine m) {
+                  if (m.particle == null || m.holoLevel == null) {
+                      return;
+                  }
+                  m.particle.setTitle(holoText(m));
+                  m.holoLevel.addParticle(m.particle);
+              }
+
+              private void removeHolo(Mine m) {
+                  if (m.particle != null && m.holoLevel != null) {
+                      m.particle.setInvisible(true);
+                      m.holoLevel.addParticle(m.particle);
+                  }
+                  m.particle = null;
+                  m.holoLevel = null;
+              }
+
+              // ------------------------------------------------------------------ обход регион-плагина
+
+              private boolean inAnyMine(Level lvl, int x, int y, int z) {
+                  if (lvl == null) {
+                      return false;
+                  }
+                  String w = lvl.getFolderName();
+                  for (Mine m : mines.values()) {
+                      if (m.contains(w, x, y, z)) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST)
+              public void onBreak(BlockBreakEvent e) {
+                  if (!bypass || !e.isCancelled()) {
+                      return;
+                  }
+                  Player p = e.getPlayer();
+                  if (p == null || p.isSpectator() || p.isAdventure()) {
+                      return;
+                  }
+                  Block b = e.getBlock();
+                  if (inAnyMine(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ())) {
+                      e.setCancelled(false);
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST)
+              public void onInteract(PlayerInteractEvent e) {
+                  if (!bypass || !e.isCancelled()) {
+                      return;
+                  }
+                  if (e.getAction() != PlayerInteractEvent.Action.LEFT_CLICK_BLOCK) {
+                      return;
+                  }
+                  Player p = e.getPlayer();
+                  if (p == null || p.isSpectator() || p.isAdventure()) {
+                      return;
+                  }
+                  Block b = e.getBlock();
+                  if (b != null && inAnyMine(b.getLevel(), b.getFloorX(), b.getFloorY(), b.getFloorZ())) {
+                      e.setCancelled(false);
+                  }
+              }
+
+              // ------------------------------------------------------------------ команды
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+                  if (!sender.hasPermission("mine.admin")) {
+                      sender.sendMessage(msg("no-permission"));
+                      return true;
+                  }
+                  switch (cmd.getName().toLowerCase()) {
+                      case "mine":
+                          return cmdMine(sender, args);
+                      case "shap":
+                          return cmdShap(sender, args);
+                      case "ssset":
+                          return cmdSsset(sender, args);
+                      case "sdel":
+                          return cmdSdel(sender, args);
+                      case "slist":
+                          return cmdSlist(sender);
+                      default:
+                          return false;
+                  }
+              }
+
+              private boolean cmdMine(CommandSender sender, String[] args) {
+                  if (!(sender instanceof Player)) {
+                      sender.sendMessage(msg("only-player"));
+                      return true;
+                  }
+                  Player p = (Player) sender;
+                  if (args.length == 0) {
+                      sender.sendMessage(msg("usage-mine"));
+                      return true;
+                  }
+                  Selection sel = selections.computeIfAbsent(p.getUniqueId(), k -> new Selection());
+                  switch (args[0].toLowerCase()) {
+                      case "pos1":
+                          sel.w1 = p.getLevel().getFolderName();
+                          sel.p1 = new int[]{p.getFloorX(), p.getFloorY(), p.getFloorZ()};
+                          sender.sendMessage(msg("pos-set", "n", "1", "pos", Arrays.toString(sel.p1)));
+                          return true;
+                      case "pos2":
+                          sel.w2 = p.getLevel().getFolderName();
+                          sel.p2 = new int[]{p.getFloorX(), p.getFloorY(), p.getFloorZ()};
+                          sender.sendMessage(msg("pos-set", "n", "2", "pos", Arrays.toString(sel.p2)));
+                          return true;
+                      case "create":
+                          return createMine(p, sel, args);
+                      default:
+                          sender.sendMessage(msg("usage-mine"));
+                          return true;
+                  }
+              }
+
+              private boolean createMine(Player p, Selection sel, String[] args) {
+                  if (args.length < 2) {
+                      p.sendMessage(msg("usage-mine"));
+                      return true;
+                  }
+                  String name = args[1];
+                  if (!NAME.matcher(name).matches()) {
+                      p.sendMessage(msg("name-invalid"));
+                      return true;
+                  }
+                  if (mines.containsKey(name.toLowerCase())) {
+                      p.sendMessage(msg("mine-exists", "mine", name));
+                      return true;
+                  }
+                  if (sel.p1 == null || sel.p2 == null || sel.w1 == null || !sel.w1.equals(sel.w2)) {
+                      p.sendMessage(msg("need-selection"));
+                      return true;
+                  }
+                  Mine m = new Mine(name);
+                  m.world = sel.w1;
+                  m.minX = Math.min(sel.p1[0], sel.p2[0]);
+                  m.minY = Math.min(sel.p1[1], sel.p2[1]);
+                  m.minZ = Math.min(sel.p1[2], sel.p2[2]);
+                  m.maxX = Math.max(sel.p1[0], sel.p2[0]);
+                  m.maxY = Math.max(sel.p1[1], sel.p2[1]);
+                  m.maxZ = Math.max(sel.p1[2], sel.p2[2]);
+                  long vol = (long) m.sizeX() * m.sizeY() * m.sizeZ();
+                  if (vol > maxVolume) {
+                      p.sendMessage(msg("too-big", "vol", String.valueOf(vol), "max", String.valueOf(maxVolume)));
+                      return true;
+                  }
+                  m.current = randomRarityKey();
+                  m.next = randomRarityKey();
+                  m.remaining = interval;
+                  mines.put(name.toLowerCase(), m);
+                  saveMines();
+                  startReset(m, true);
+                  p.sendMessage(msg("created", "mine", name, "vol", String.valueOf(vol)));
+                  return true;
+              }
+
+              private Mine findMine(CommandSender sender, String[] args) {
+                  if (args.length < 1) {
+                      return null;
+                  }
+                  Mine m = mines.get(args[0].toLowerCase());
+                  if (m == null) {
+                      sender.sendMessage(msg("mine-missing", "mine", args[0]));
+                  }
+                  return m;
+              }
+
+              private boolean cmdShap(CommandSender sender, String[] args) {
+                  if (!(sender instanceof Player)) {
+                      sender.sendMessage(msg("only-player"));
+                      return true;
+                  }
+                  if (args.length < 1) {
+                      sender.sendMessage(msg("usage-shap"));
+                      return true;
+                  }
+                  Mine m = findMine(sender, args);
+                  if (m == null) {
+                      return true;
+                  }
+                  Player p = (Player) sender;
+                  removeHolo(m);
+                  m.hasHolo = true;
+                  m.holoWorld = p.getLevel().getFolderName();
+                  m.hx = p.x;
+                  m.hy = p.y + holoOffset;
+                  m.hz = p.z;
+                  ensureHolo(m);
+                  updateHolo(m);
+                  saveMines();
+                  sender.sendMessage(msg("holo-set", "mine", m.name));
+                  return true;
+              }
+
+              private boolean cmdSsset(CommandSender sender, String[] args) {
+                  if (!(sender instanceof Player)) {
+                      sender.sendMessage(msg("only-player"));
+                      return true;
+                  }
+                  if (args.length < 1) {
+                      sender.sendMessage(msg("usage-ssset"));
+                      return true;
+                  }
+                  Mine m = findMine(sender, args);
+                  if (m == null) {
+                      return true;
+                  }
+                  Player p = (Player) sender;
+                  m.hasSpawn = true;
+                  m.spawnWorld = p.getLevel().getFolderName();
+                  m.sx = p.x;
+                  m.sy = p.y;
+                  m.sz = p.z;
+                  m.syaw = p.yaw;
+                  m.spitch = p.pitch;
+                  saveMines();
+                  sender.sendMessage(msg("spawn-set", "mine", m.name));
+                  return true;
+              }
+
+              private boolean cmdSdel(CommandSender sender, String[] args) {
+                  if (args.length < 1) {
+                      sender.sendMessage(msg("usage-sdel"));
+                      return true;
+                  }
+                  Mine m = findMine(sender, args);
+                  if (m == null) {
+                      return true;
+                  }
+                  removeHolo(m);
+                  final Mine target = m;
+                  jobs.removeIf(j -> j.mine == target);
+                  mines.remove(m.name.toLowerCase());
+                  saveMines();
+                  sender.sendMessage(msg("deleted", "mine", m.name));
+                  return true;
+              }
+
+              private boolean cmdSlist(CommandSender sender) {
+                  if (mines.isEmpty()) {
+                      sender.sendMessage(msg("list-empty"));
+                      return true;
+                  }
+                  sender.sendMessage(msg("list-header", "count", String.valueOf(mines.size())));
+                  for (Mine m : mines.values()) {
+                      Rarity c = rarities.get(m.current);
+                      int t = Math.max(0, m.remaining);
+                      sender.sendMessage(msg("list-line",
+                              "mine", m.name,
+                              "world", m.world,
+                              "rarity", c == null ? m.current : c.color + c.name,
+                              "time", String.format("%02d:%02d", t / 60, t % 60)));
+                  }
+                  return true;
+              }
+
+              // ------------------------------------------------------------------ вспомогательные классы
+
+              private static class Selection {
+                  String w1;
+                  String w2;
+                  int[] p1;
+                  int[] p2;
+              }
+
+              private static class FillJob {
+                  final Mine mine;
+                  final Level level;
+                  final int[] ids;
+                  int idx = 0;
+
+                  FillJob(Mine mine, Level level, int[] ids) {
+                      this.mine = mine;
+                      this.level = level;
+                      this.ids = ids;
+                  }
+              }
+
+              private static class Mine {
+                  final String name;
+                  String world;
+                  int minX, minY, minZ, maxX, maxY, maxZ;
+                  String current;
+                  String next;
+                  int remaining;
+                  boolean filling;
+                  boolean hasSpawn;
+                  String spawnWorld;
+                  double sx, sy, sz, syaw, spitch;
+                  boolean hasHolo;
+                  String holoWorld;
+                  double hx, hy, hz;
+                  FloatingTextParticle particle;
+                  Level holoLevel;
+
+                  Mine(String name) {
+                      this.name = name;
+                  }
+
+                  int sizeX() {
+                      return maxX - minX + 1;
+                  }
+
+                  int sizeY() {
+                      return maxY - minY + 1;
+                  }
+
+                  int sizeZ() {
+                      return maxZ - minZ + 1;
+                  }
+
+                  int volume() {
+                      return sizeX() * sizeY() * sizeZ();
+                  }
+
+                  boolean contains(String w, int x, int y, int z) {
+                      return world != null && world.equals(w)
+                              && x >= minX && x <= maxX
+                              && y >= minY && y <= maxY
+                              && z >= minZ && z <= maxZ;
+                  }
+              }
+
+              private static class Rarity {
+                  final String key;
+                  final String name;
+                  final String color;
+                  final double chance;
+                  private final List<Integer> idList = new ArrayList<>();
+                  private final List<Double> weightList = new ArrayList<>();
+                  private int[] ids;
+                  private double[] cumulative;
+                  private double total;
+
+                  Rarity(String key, String name, String color, double chance) {
+                      this.key = key;
+                      this.name = name;
+                      this.color = color;
+                      this.chance = chance;
+                  }
+
+                  void add(int id, double weight) {
+                      if (weight > 0) {
+                          idList.add(id);
+                          weightList.add(weight);
+                      }
+                  }
+
+                  void finish() {
+                      ids = new int[idList.size()];
+                      cumulative = new double[idList.size()];
+                      total = 0;
+                      for (int i = 0; i < ids.length; i++) {
+                          ids[i] = idList.get(i);
+                          total += weightList.get(i);
+                          cumulative[i] = total;
+                      }
+                  }
+
+                  boolean isEmpty() {
+                      return ids == null || ids.length == 0;
+                  }
+
+                  int pick(ThreadLocalRandom rnd) {
+                      double r = rnd.nextDouble() * total;
+                      for (int i = 0; i < ids.length; i++) {
+                          if (r < cumulative[i]) {
+                              return ids[i];
+                          }
+                      }
+                      return ids[ids.length - 1];
+                  }
+              }
+          }
+          JAVAEOF
+
+      - name: Create plugin.yml
+        run: |
+          mkdir -p project/src/main/resources
+          cat > project/src/main/resources/plugin.yml <<'PLUGINEOF'
+          name: AutoMine
+          main: ru.eclips.automine.AutoMine
+          version: 1.0.1
+          api: ["1.0.0"]
+          author: Eclips
+          description: Авто-шахты с редкостями, плашкой и обходом регион-плагина
+          # Добавь сюда название своего регион-плагина, чтобы AutoMine загружался после него
+          softdepend: [WorldGuard, RegionProtect, RegionGuard, Regions, WGuard]
+
+          commands:
+            mine:
+              description: Создание шахты (pos1, pos2, create)
+              usage: /mine <pos1|pos2|create <название>>
+              permission: mine.admin
+            shap:
+              description: Установить плашку шахты на вашей позиции
+              usage: /shap <название>
+              permission: mine.admin
+            ssset:
+              description: Установить точку телепорта при сбросе шахты
+              usage: /ssset <название>
+              permission: mine.admin
+            sdel:
+              description: Удалить авто-шахту
+              usage: /sdel <название>
+              permission: mine.admin
+            slist:
+              description: Список авто-шахт
+              usage: /slist
+              permission: mine.admin
+
+          permissions:
+            mine.admin:
+              description: Управление авто-шахтами
+              default: op
+          PLUGINEOF
+
+      - name: Create config.yml
+        run: |
+          mkdir -p project/src/main/resources
+          cat > project/src/main/resources/config.yml <<'CONFIGEOF'
+          # ============================================================
+          #  AutoMine: настройки
+          #  Цвета: § (или &). Шансы считаются в относительных весах,
+          #  суммы не обязаны равняться 100.
+          # ============================================================
+
+          # Версия конфига (не меняй). При обновлении плагина старый config.yml
+          # сохраняется как config-old-vN.yml, а данные шахт (mines.yml) не трогаются.
+          config-version: 2
+
+          # Сброс всех шахт, секунд
+          reset-interval-seconds: 300
+
+          # За сколько секунд до сброса писать предупреждение в чат
+          warning-seconds: [60, 30, 10]
+
+          # Кому писать предупреждения: игрокам не дальше N блоков от шахты
+          warning-radius: 100
+
+          # Сколько блоков заполнять за один тик (меньше = меньше лагов, дольше сброс)
+          fill-blocks-per-tick: 4000
+
+          # Максимальный объём шахты в блоках
+          max-volume: 1000000
+
+          # Высота плашки над твоей позицией при /shap
+          hologram-y-offset: 1.0
+
+          # Снимать запрет ломания от регион-плагина внутри шахт
+          bypass-region-protection: true
+
+          # Текст плашки (\n = новая строка). Плейсхолдеры: {time} {cur_color} {cur_name} {next_color} {next_name}
+          hologram-format: "§l§eДо сброса осталось §l§c{time}\n§l§eтекущая редкость {cur_color}§l{cur_name} §l§eследующая редкость {next_color}§l{next_name}"
+
+          # ID блоков. Если в твоём ядре ID древних обломков другой, поменяй здесь.
+          block-ids:
+            stone: 1
+            coal_ore: 16
+            iron_ore: 15
+            gold_ore: 14
+            redstone_ore: 73
+            lapis_ore: 21
+            diamond_ore: 56
+            emerald_ore: 129
+            ancient_debris: 526
+
+          # Гарантированный минимум за каждый сброс (недостающее ставится вместо камня)
+          guaranteed-min:
+            diamond_ore: 3
+            ancient_debris: 1
+
+          # Максимум за сброс (0 или убрать = без ограничения). Лишнее заменяется камнем.
+          max-per-reset:
+            diamond_ore: 0
+            ancient_debris: 0
+
+          # Редкости. chance: шанс, что именно эта редкость выпадет после сброса.
+          # blocks: шансы блоков внутри шахты.
+          rarities:
+            common:
+              name: "Обычная"
+              color: "§7"
+              chance: 45
+              blocks:
+                stone: 72
+                coal_ore: 17
+                iron_ore: 7
+                gold_ore: 2.5
+                diamond_ore: 1.3
+                ancient_debris: 0.2
+            rare:
+              name: "Редкая"
+              color: "§a"
+              chance: 28
+              blocks:
+                stone: 58
+                coal_ore: 17
+                iron_ore: 12
+                gold_ore: 5
+                lapis_ore: 3.5
+                diamond_ore: 4
+                ancient_debris: 0.5
+            very_rare:
+              name: "Очень редкая"
+              color: "§9"
+              chance: 15
+              blocks:
+                stone: 50
+                iron_ore: 16
+                gold_ore: 10
+                redstone_ore: 8
+                lapis_ore: 6
+                diamond_ore: 7
+                emerald_ore: 1.5
+                ancient_debris: 1.5
+            epic:
+              name: "Эпическая"
+              color: "§5"
+              chance: 9
+              blocks:
+                stone: 44
+                gold_ore: 13
+                redstone_ore: 10
+                lapis_ore: 8
+                diamond_ore: 14
+                emerald_ore: 9
+                ancient_debris: 2
+            legendary:
+              name: "Легендарная"
+              color: "§6"
+              chance: 3
+              blocks:
+                stone: 29
+                gold_ore: 14
+                redstone_ore: 7
+                diamond_ore: 28
+                emerald_ore: 18
+                ancient_debris: 4
+
+          # Сообщения. Плейсхолдеры в фигурных скобках.
+          messages:
+            no-permission: "§cУ тебя нет прав на эту команду."
+            only-player: "§cЭту команду можно использовать только в игре."
+            usage-mine: "§eИспользование: /mine pos1 | /mine pos2 | /mine create <название>"
+            usage-shap: "§eИспользование: /shap <название>"
+            usage-ssset: "§eИспользование: /ssset <название>"
+            usage-sdel: "§eИспользование: /sdel <название>"
+            pos-set: "§aТочка {n} установлена: §f{pos}"
+            need-selection: "§cСначала задай обе точки (/mine pos1 и /mine pos2) в одном мире."
+            name-invalid: "§cНазвание: только латиница, цифры, _ и -, до 32 символов."
+            mine-exists: "§cШахта {mine} уже существует."
+            mine-missing: "§cШахта {mine} не найдена."
+            too-big: "§cШахта слишком большая: {vol} блоков (максимум {max})."
+            created: "§aШахта §f{mine} §aсоздана ({vol} блоков). Дальше: §f/shap {mine} §aи §f/ssset {mine}"
+            holo-set: "§aПлашка шахты {mine} установлена."
+            spawn-set: "§aТочка телепорта шахты {mine} установлена."
+            deleted: "§aШахта {mine} удалена."
+            list-empty: "§eАвто-шахт нет."
+            list-header: "§eАвто-шахты ({count}):"
+            list-line: "§f{mine} §7({world}) §f- {rarity} §7- до сброса §f{time}"
+            warning: "§eШахта §f{mine} §eбудет сброшена через §f{sec} §eсек."
+            reset-done: "§aШахта §f{mine} §aобновлена. Редкость: {rarity}"
+            teleported: "§eШахта {mine} сбросилась, тебя телепортировало."
+          CONFIGEOF
+
+      - name: Create pom.xml
+        run: |
+          mkdir -p project
+          cat > project/pom.xml <<'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+
+              <groupId>ru.eclips</groupId>
+              <artifactId>AutoMine</artifactId>
+              <version>1.0.1</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>lanink-repo</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <!-- Ядро Nukkit MOT. Если репозиторий не отдаёт зависимость, положи jar своего ядра
+                       в папку libs/ и замени этот блок на system-scope (см. комментарий ниже). -->
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+
+                  <!--
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>local</version>
+                      <scope>system</scope>
+                      <systemPath>${project.basedir}/libs/nukkit-mot.jar</systemPath>
+                  </dependency>
+                  -->
+              </dependencies>
+
+              <build>
+                  <finalName>AutoMine</finalName>
+                  <resources>
+                      <resource>
+                          <directory>src/main/resources</directory>
+                          <filtering>false</filtering>
+                      </resource>
+                  </resources>
+              </build>
+          </project>
+          POMEOF
+
+      - name: Build with Maven
+        run: mvn -B -f project/pom.xml clean package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoMine
+          path: project/target/AutoMine.jar
+          if-no-files-found: error
